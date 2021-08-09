@@ -1,3 +1,4 @@
+#include <TimerOne.h>
 
 /*___________PWM Frequency table____________
           3     5     6     9    10    11
@@ -13,99 +14,35 @@
 /*__________________Setting_____________________
   | pole   |  +  |  -  |  +  |  -  |  +  |  -  |
   | mosfet |  Q1 |  Q2 |  Q3 |  Q4 |  Q5 |  Q6 |
-  | pin    |  D9 |  D6 | D10 |  D5 | D11 |  D3 |
-  | freq   | 488 | 244 | 488 | 244 | 488 | 244 |
+  | pin    |  D3 |  D8 |  D5 |  D9 |  D6 | D10 |
+  | freq   | 976 | 000 | 976 | 000 | 976 | 000 |
   ________________________________________________*/
 
-String cmdTopic;  //  topic of command
-int cmdVal;       //  value of command
-
-boolean dir = true;         //  true = cw direction
-int ampMax = 0, amp = 127;  //  amplitude
-float freq = 0, period = 0; //  frequency and period
-unsigned long prevTime = 0; //  start timer
-
-int nGate[7] = {-1, 9, 7, 10, 8, 11, 12};
-#define deadTime 120 //  micro senconds unit
-#define ON 255       //  100% duty cycle 
-#define OFF  0       //    0% duty cycle
-
-boolean allowChange = true;
-uint8_t sectorOut = 0;
-double count = 0;
+#define potPin A0 
+#define intPin 0
+#define maxFreq 900
+#define minFreq 0
+#define SwingError 3
+#define minSpdStart 30
+float freq = 0, 
+      period = 0, 
+      prevFreq = 0;
+volatile boolean finishTime = true, 
+                 finishBEMF = true; 
 boolean enableIRS = false;
-
-float currTime = 0;
-int sector = 1;
-
-  
-String getSplit(String data, char separator, int index)
+uint8_t amp = 127, 
+        sector = 0;
+void finishTime_update()
 {
-  int found = 0;
-  int strIndex[] = {0, -1};
-  int maxIndex = data.length() - 1;
-
-  for (int i = 0; i <= maxIndex && found <= index; i++)
-  {
-    if (data.charAt(i) == separator || i == maxIndex)
-    {
-      found++;
-      strIndex[0] = strIndex[1] + 1;
-      strIndex[1] = (i == maxIndex) ? i + 1 : i;
-    }
-  }
-  return found > index ? data.substring(strIndex[0], strIndex[1]) : "";
+  finishTime = true;
 }
-float getPeriod(float freq)
-{
-  return 1000000 / freq;
-}
-void setPwmFrequency(int pin, int divisor)
-{
-  byte mode;
-  if (pin == 5 || pin == 6 || pin == 9 || pin == 10)
-  {
-    switch (divisor)
-    {
-      case 1: mode = 0x01; break;
-      case 8: mode = 0x02; break;
-      case 64: mode = 0x03; break;
-      case 256: mode = 0x04; break;
-      case 1024: mode = 0x05; break;
-      default: return;
-    }
-    if (pin == 5 || pin == 6)
-    {
-      TCCR0B = TCCR0B & 0b11111000 | mode;
-    }
-    else
-    {
-      TCCR1B = TCCR1B & 0b11111000 | mode;
-    }
-  }
-  else if (pin == 3 || pin == 11)
-  {
-    switch (divisor)
-    {
-      case 1: mode = 0x01; break;
-      case 8: mode = 0x02; break;
-      case 32: mode = 0x03; break;
-      case 64: mode = 0x04; break;
-      case 128: mode = 0x05; break;
-      case 256: mode = 0x06; break;
-      case 1024: mode = 0x07; break;
-      default: return;
-    }
-    TCCR2B = TCCR2B & 0b11111000 | mode;
-  }
-} 
-void setSector()
+void finishBEMF_update()
 {
   if(enableIRS)
   {
-//    for(int i=0; i<3; i++)
+//     for(int i=0; i<5; i++)
 //    {
-//      if(sectorOut == 2 && sectorOut == 4 && sectorOut == 6)
+//      if(sector == 1 && sector == 3 && sector == 5)
 //      {
 //        if(digitalRead(2) == LOW) i -= 1;
 //      }
@@ -114,168 +51,151 @@ void setSector()
 //        if(digitalRead(2) == HIGH) i -= 1;
 //      }
 //    }
-    allowChange = true;
+    finishBEMF = true;
+  }
+}
+void setMux(uint8_t sector)
+{
+       if(sector == 0 || sector == 2 || sector == 4) attachInterrupt(intPin, finishBEMF_update, RISING); 
+  else if(sector == 1 || sector == 3 || sector == 5) attachInterrupt(intPin, finishBEMF_update, FALLING); 
+         
+  if(sector == 0 || sector == 3)
+  { // 010
+    PORTC = ~(1 << 1) & PORTC;
+    PORTC =  (1 << 2) | PORTC;
+    PORTC = ~(1 << 3) & PORTC;
+  } 
+  else if(sector == 1 || sector == 4)
+  { // 100
+    PORTC =  (1 << 1) | PORTC;
+    PORTC = ~(1 << 2) & PORTC;
+    PORTC = ~(1 << 3) & PORTC;
+  } 
+  else if(sector == 2 || sector == 5)
+  { // 000
+    PORTC = ~(1 << 1) & PORTC;
+    PORTC = ~(1 << 2) & PORTC;
+    PORTC = ~(1 << 3) & PORTC;
+  } 
+}
+void setSector(uint8_t PWM, int8_t sector)
+{
+  if(sector == -1)
+  { // 000
+    PORTB = ~(1 << 0) & PORTB;
+    PORTB = ~(1 << 1) & PORTB;
+    PORTB = ~(1 << 2) & PORTB;
+    TCCR0A = 0;
+    TCCR2A = 0;
+//    OCR0B = 0; // 5
+//    OCR0A = 0; // 6
+//    OCR2A = 0; // 11
+  }
+  else if(sector == 0)
+  { // +-0
+//    OCR0B = PWM; // 5
+//    OCR2A = 0; // 11
+    PORTB = ~(1 << 2) & PORTB;
+    TCCR0A |= B00100111; // 5
+    TCCR2A = 0; // 11  
+  }
+  else if(sector == 1)
+  { // +0-
+    
+//    OCR0B = PWM; // 5
+    PORTB = ~(1 << 1) & PORTB;
+    PORTB =  (1 << 2) | PORTB;
+
+    TCCR0A |= B00100111;; // 5
+  }
+  else if(sector == 2)
+  { // 0+-
+//    OCR0B = 0; // 5
+//    OCR0A = PWM; // 6
+
+    TCCR0A |= B10000111; // 5 6
+  }
+  else if(sector == 3)
+  { // -+0
+//    OCR0A = PWM; // 6
+    PORTB =  (1 << 0) | PORTB;
+    PORTB = ~(1 << 2) & PORTB; 
+
+    TCCR0A |= B10000111; // 6
+  }
+  else if(sector == 4)
+  { // -0+
+//    OCR0A = 0; // 6
+//    OCR2A = PWM; // 11
+
+   TCCR0A = 0; // 6
+   TCCR2A |= B10000111; // 11
+  }
+  else if(sector == 5)
+  { // 0-+
+    
+//    OCR2A = PWM; // 11
+    PORTB = ~(1 << 0) & PORTB;
+    PORTB =  (1 << 1) | PORTB; 
+
+    TCCR2A |= B10000111; // 11
   }
 }
 void setup()
 {
   Serial.begin(115200);
-  while(!Serial);
-  attachInterrupt(0, setSector, RISING);
-  setPwmFrequency(3, 128);
-  setPwmFrequency(5, 256);
-  setPwmFrequency(6, 256);
-//  setPwmFrequency(9, 64);
-//  setPwmFrequency(10, 64);
-//  setPwmFrequency(11, 64);
-  setPwmFrequency(9, 8);
-  setPwmFrequency(10, 8);
-  setPwmFrequency(11, 8);
-  pinMode(A1, OUTPUT);
-  pinMode(A2, OUTPUT);
-  pinMode(A3, OUTPUT);
-  pinMode(nGate[1], OUTPUT);
-  pinMode(nGate[2], OUTPUT);
-  pinMode(nGate[3], OUTPUT);
-  pinMode(nGate[4], OUTPUT);
-  pinMode(nGate[5], OUTPUT);
-  pinMode(nGate[6], OUTPUT);
-//  pinMode(2, INPUT_PULLUP);
+  Timer1.attachInterrupt(finishTime_update);
+  DDRB |= 0x0F; // กำหนดพอร์ต b พิน 0(D8) 1(D9) 2(D10) 3(D11*) เป็น output
+  DDRC |= 0x0E; // กำหนดพอร์ต c พิน 1(A1) 2(A2) 3(A3) เป็น output
+  DDRD |= 0x60; // d 5(D5) 6(D6)
+  
+  TCCR0A = 0; 
+//  TCCR0A |= B10100111; // COM0A1, COM0B1, WGM00, WGM01, WGM02
+  TCCR0B |= 0x03; // กำหนด prescale ของ timer2(5, 6) เป็น 64
+
+  TCCR2A = 0;
+//  TCCR2A |= B10100111; // กำหนด COM2A1, COM2B1, WGM21, WGM20
+  TCCR2B |= 0x03; // กำหนด prescale ของ timer2(3, 11) เป็น 32
+
+
+    OCR0B = amp; // 5
+    OCR0A = amp; // 6
+    OCR2A = amp; // 11
 }
 void loop()
 {
-//  Serial.println(analogRead(A0));
-//  if (Serial.available())
-//  {
-//    String cmdRaw = Serial.readString();
-//    cmdTopic = getSplit(cmdRaw, '=', 0);
-//    String val = getSplit(cmdRaw, '=', 1);
-//    cmdVal = val.toInt();
-//    //    Serial.println("topic: " + cmdTopic + ", value: " + cmdVal);
-//
-//    if (cmdTopic == "a")
-//    {
-//      ampMax = cmdVal;
-//      Serial.print("amplitude: ");
-//      Serial.println(ampMax);
-//    }
-//    else if (cmdTopic == "d") dir = cmdVal;
-//    else if (cmdTopic == "f")
-//    {
-//      freq = cmdVal;
-//      period = getPeriod(freq);
-//      Serial.print("period: ");
-//      Serial.println(period);
-//    }
-//  }
-
-
-  freq = map(analogRead(A0), 0, 1023, 0, 1200);
-  period = getPeriod(abs(freq));
-  float timeSector = period/6;
-//  float timeSector = 300000; // for test
-  
-//  Serial.println(freq);
-//  amp = ampMax; // set amplitude
-//  prevTime = micros();
-
-//  Serial.println(allowChange);
-  
-  if(freq > 80 || freq < -80)
+  freq = map(analogRead(potPin), 0, 1023, minFreq, maxFreq);
+  if(freq > prevFreq+SwingError || freq < prevFreq-SwingError)
   {
-//    while(currTime < period)
-//    {
-      currTime =  micros() - prevTime;
-      if(currTime >= timeSector &&  allowChange)
-      {
-        enableIRS = false;
-//        pulseGen(0, 0);
-        sector++;
-        if(sector >= 7) sector = 1;
-        setMux(sector);
+    prevFreq = freq;
+//    period = 12000000;
+    period = 1000000/abs(freq);
+    Timer1.initialize(period/6);
+  }
+
+  if(freq > minSpdStart)
+  {
+    if(finishTime) // && finishBEMF)
+    {
+      enableIRS = false;
+      
+      sector++;
+      sector %= 6; 
+      setMux(sector);
+      
+      finishTime = false;
+      finishBEMF = false;
+    }
+    else
+    {
+      enableIRS = true;
+      setSector(amp, sector);
+    }
    
-        allowChange = false;
-        prevTime = micros();
-      }
-      else
-      {
-        enableIRS = true;
-//        sectorOut = sector;
-//        if(freq < 0)
-//        {
-//          sectorOut = 7-sector;
-//        }
-        pulseGen(amp, sector); 
-//        Serial.println(sector);
-      }
-//    }
   }
   else
   {
-    pulseGen(0, 0);
-    prevTime = micros();
-    allowChange = true;
-    //  stop motor
+    setSector(0, -1);
+    finishBEMF = true;
   }
-}
-void selectInput(boolean bitA, boolean bitB, boolean bitC)
-{
-  digitalWrite(A1, bitA);
-  digitalWrite(A2, bitB);
-  digitalWrite(A3, bitC);
-}
-void pulseGen(uint8_t PWM, uint8_t sector)
-{
-  if(sector == 0)
-  {
-    analogWrite(nGate[1], 0); digitalWrite(nGate[2], 0); // 0
-    analogWrite(nGate[3], 0); digitalWrite(nGate[4], 0); // 0
-    analogWrite(nGate[5], 0); digitalWrite(nGate[6], 0); // 0
-    delayMicroseconds(deadTime);
-  }
-  else if(sector == 1)
-  {
-    analogWrite(nGate[1], PWM); digitalWrite(nGate[2], 0); // +
-    analogWrite(nGate[3], 0);   digitalWrite(nGate[4], 1); // -
-    analogWrite(nGate[5], 0);   digitalWrite(nGate[6], 0); // 0
-  }
-  else if(sector == 2)
-  {
-    analogWrite(nGate[1], PWM); digitalWrite(nGate[2], 0); // +
-    analogWrite(nGate[3], 0);   digitalWrite(nGate[4], 0); // 0
-    analogWrite(nGate[5], 0);   digitalWrite(nGate[6], 1); // -
-  }
-  else if(sector == 3)
-  {
-    analogWrite(nGate[1], 0);   digitalWrite(nGate[2], 0); // 0
-    analogWrite(nGate[3], PWM); digitalWrite(nGate[4], 0); // +
-    analogWrite(nGate[5], 0);   digitalWrite(nGate[6], 1); // -
-  }
-  else if(sector == 4)
-  {
-    analogWrite(nGate[1], 0);   digitalWrite(nGate[2], 1); // -
-    analogWrite(nGate[3], PWM); digitalWrite(nGate[4], 0); // +
-    analogWrite(nGate[5], 0);   digitalWrite(nGate[6], 0); // 0
-  }
-  else if(sector == 5)
-  {
-    analogWrite(nGate[1], 0);   digitalWrite(nGate[2], 1); // -
-    analogWrite(nGate[3], 0);   digitalWrite(nGate[4], 0); // 0
-    analogWrite(nGate[5], PWM); digitalWrite(nGate[6], 0); // + 
-  }
-  else if(sector == 6)
-  {
-    analogWrite(nGate[1], 0);   digitalWrite(nGate[2], 0); // 0
-    analogWrite(nGate[3], 0);   digitalWrite(nGate[4], 1); // -
-    analogWrite(nGate[5], PWM); digitalWrite(nGate[6], 0); // +
-  }
-}
-void setMux(int sector)
-{
-       if(sector == 1){ selectInput(0, 1, 0); attachInterrupt(0, setSector, RISING);  }
-  else if(sector == 2){ selectInput(1, 0, 0); attachInterrupt(0, setSector, FALLING); }
-  else if(sector == 3){ selectInput(0, 0, 0); attachInterrupt(0, setSector, RISING);  }
-  else if(sector == 4){ selectInput(0, 1, 0); attachInterrupt(0, setSector, FALLING); }
-  else if(sector == 5){ selectInput(1, 0, 0); attachInterrupt(0, setSector, RISING);  }
-  else if(sector == 6){ selectInput(0, 0, 0); attachInterrupt(0, setSector, FALLING); } 
 }
