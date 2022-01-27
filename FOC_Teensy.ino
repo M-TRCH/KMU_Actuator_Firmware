@@ -108,51 +108,109 @@ void inverse_clarke(float Vx_, float Vy_)
 /* encoder */
 // pins define
 #define A_CH_pin 5
-#define B_CH_pin 6
-#define Z_CH_pin 4
+#define B_CH_pin 4
+#define Z_CH_pin 6
 // encoder rountine
 #include <TimerThree.h>
-#define max_motor_spd 180.0f  // unit -> rpm
-#define ppr 3600.0f           // pulse per revolution
+#define max_motor_spd 480.0f  // unit -> rpm
+#define ppr 2048.0f           // pulse per revolution
 #define detect_freq_ratio 10  // actual freq = ratio * freq
 const float encoder_freq =  max_motor_spd / 60.0f * ppr;
 const float encoder_period = 1000000.0f / encoder_freq / detect_freq_ratio; // unit -> us
 // parameter
 #define pp 20.0f  // pole-pair of motor
 const float deg_per_pul = 360.0f / ppr * pp;
-float theta = 0;
-volatile boolean rising_edge = false;
+const float deg_per_pul_rev = 360.0f / ppr;
+float theta = 0, theta_rev = 0; // theta = rotor position, theta_rev = theta in revolution
+volatile boolean A_rising = false;
+volatile boolean Z_rising = false;
+// alignment
+#define align_freg 1000.0f
+#define align_theta_res 0.001f // (+)value = ccw, (-)value  = cw
+#define align_vector 10.0f
+const float align_period = 1000.0f / align_freg;  // unit -> ms  
+unsigned long align_prevTime = 0;
+float index_theta, align_theta;
 
 void encoder_event()
 {
-  if(digitalRead(A_CH_pin) == HIGH && !rising_edge)
+  if(digitalRead(Z_CH_pin) == HIGH && !Z_rising)
+    Z_rising = true;
+  if(digitalRead(Z_CH_pin) == LOW && Z_rising)
   {
-    rising_edge = true;        
+    Z_rising = false;
+    theta = index_theta;
+    theta_rev = 0;
   }
-  if(digitalRead(A_CH_pin) == LOW && rising_edge)
+  
+  if(digitalRead(A_CH_pin) == HIGH && !A_rising)
+    A_rising = true;        
+  if(digitalRead(A_CH_pin) == LOW && A_rising)
   {
-    rising_edge = false;        
-    if(digitalRead(B_CH_pin)) theta -= deg_per_pul;
-    else                      theta += deg_per_pul;  
-
-         if(theta > 360)  theta = deg_per_pul;
-    else if(theta <   0)  theta = 360.0f - deg_per_pul;
+    A_rising = false;        
+    if(digitalRead(B_CH_pin))
+    {
+      theta += deg_per_pul;
+      theta_rev += deg_per_pul_rev;
+    }
+    else
+    {
+      theta -= deg_per_pul; 
+      theta_rev -= deg_per_pul_rev;             
+    }
+    
+         if(theta > 360)  theta = theta - 360.0f;
+    else if(theta <   0)  theta = 360.0f + theta;
+         if(theta_rev > 360)  theta_rev = theta_rev - 360.0f;
+    else if(theta_rev <   0)  theta_rev = 360.0f + theta_rev;
   }  
 }
-
+void rotor_position_alignment()
+{
+  align_prevTime = millis();
+  while(!digitalRead(Z_CH_pin))
+  {
+    if(millis() - align_prevTime <= align_period)
+    {
+      align_prevTime = millis();    
+      align_theta += align_theta_res;
+           if(align_theta_res > 0 && align_theta > 360) align_theta = align_theta - 360.0f;  
+      else if(align_theta_res < 0 && align_theta < 0)   align_theta = 360.0 + align_theta;  
+    }
+    inverse_clarke(align_vector * cos(align_theta * deg_to_rad),
+                   align_vector * sin(align_theta * deg_to_rad));
+  }
+  index_theta = align_theta;
+  theta = index_theta; 
+//  Serial.println(index_theta); 
+  delay(500);   motor_stop = true; 
+  delay(3000);  motor_stop = false;   
+}
 /////////////////////////////////////////////////////
 /* curent sensor */
 // config
-#define sense_baudrate 9600
-#define sense_timeout 50
-#define sense_wait_start 1000 
+#define sense_wait_start 2000 
+#define BP_pin 14  
+#define CP_pin 17
+#define mV_A_ratio 100.0f   // typical ratio of +-20A range
+#define R1_divider  4700.0f // unit -> ohm
+#define R2_divider  6800.0f 
+#define signal_input 5.0f  // feedback from asc712 
+#define analog_res 12      // unit -> bit
+const float analog_res_value = pow(2, analog_res);  // -> 0-4096
+const float signal_output = signal_input * (R2_divider / (R1_divider + R2_divider)); 
+const float divider_ratio  = signal_input / signal_output;
+//float b_adc_top_range, b_adc_bottom_range;  // > top and bottom adc value range 
+//float c_adc_top_range, c_adc_bottom_range;  // for calculate adc threshold value <
+float b_adc_thres, c_adc_thres; // adc threshold value
+
 // optimize
 #include <Filters.h>
-#define coef_phase_cutoff   5.0f
+#define coef_phase_cutoff   10.0f
 #define coef_clarke_cutoff  5.0f
-#define coef_park_cutoff    0.5f
-FilterOnePole Ia_LPF(LOWPASS, coef_phase_cutoff);
+#define coef_park_cutoff    2.0f
 FilterOnePole Ib_LPF(LOWPASS, coef_phase_cutoff);
+FilterOnePole Ic_LPF(LOWPASS, coef_phase_cutoff);
 FilterOnePole Ix_LPF(LOWPASS, coef_clarke_cutoff);
 FilterOnePole Iy_LPF(LOWPASS, coef_clarke_cutoff);
 FilterOnePole Id_LPF(LOWPASS, coef_park_cutoff);
@@ -163,60 +221,78 @@ FilterOnePole Iq_LPF(LOWPASS, coef_park_cutoff);
 #define root_3_divided_by_3 0.577350269f  
 #define root_3              1.732050808f
 #define deg_to_rad          0.017453292f 
+#define align_time 200 // unit -> ms 
 float theta_deg, theta_rad, cos_theta, sin_theta;
-float Ia, Ib, Ia_f, Ib_f, Ic_f, Ia_offset, Ib_offset; 
+float Ib, Ic, Ia_f, Ib_f, Ic_f, Ib_offset, Ic_offset; 
 float Ix, Iy, Ix_f, Iy_f;         // clarke transfrom frame
 float Id, Iq, Id_f, Iq_f, Vd, Vq; // park transfrom frame
 
-volatile boolean sense_update = false;
+void phase_current_alignment()
+{
+  delay(sense_wait_start);
+  
+//  // useless phase as off  
+//  digitalWrite(AH_pin,  LOW);
+//  digitalWrite(AL_pin,  LOW);
+//  // b phase as negative drive
+//  // c phase as positive drive
+//  digitalWrite(BH_pin,  LOW);
+//  digitalWrite(BL_pin, HIGH);
+//  digitalWrite(CH_pin, HIGH);
+//  digitalWrite(CL_pin,  LOW);
+//  delay(align_time);
+//  b_adc_bottom_range = analogRead(BP_pin);
+//  c_adc_top_range    = analogRead(CP_pin);
+//  // c phase as negative drive
+//  // b phase as positive drive
+//  digitalWrite(BH_pin, HIGH);
+//  digitalWrite(BL_pin, LOW);
+//  digitalWrite(CH_pin, LOW);
+//  digitalWrite(CL_pin, HIGH);
+//  delay(align_time);
+//  c_adc_bottom_range = analogRead(CP_pin);
+//  b_adc_top_range    = analogRead(BP_pin);
+//  // all phase as off 
+//  digitalWrite(BH_pin, LOW);
+//  digitalWrite(CL_pin, LOW);
+//  
+//  // offset calculation
+//  b_adc_thres = (b_adc_top_range + b_adc_bottom_range) / 2.0f; 
+//  c_adc_thres = (c_adc_top_range + c_adc_bottom_range) / 2.0f; 
 
-//void serialEvent1()
-//{
-//  if(Serial1.find('#'))
-//  {
-//    float Ia_buf = Serial1.parseFloat(); 
-//    float Ib_buf = Serial1.parseFloat();     
-//    int sum_buf  = (int)Serial1.parseFloat();
-//    int sum = Ia_buf + Ib_buf; 
-//    if(sum_buf == sum)
-//    {
-//      Ia = Ia_buf;
-//      Ib = Ib_buf;
-//      sense_update = true;
-//    }
-//    Serial1.flush();
-//  }
-//}
+    b_adc_thres = analogRead(BP_pin);
+    c_adc_thres = analogRead(CP_pin);
+
+//  Serial.print(b_adc_thres); Serial.print(" : "); 
+//  Serial.println(c_adc_thres); 
+//  delay(50000);
+}
+void get_phase_current()
+{
+  Ib = ((b_adc_thres - analogRead(BP_pin)) / analog_res_value * 3300.0f) * divider_ratio / mV_A_ratio;
+  Ic = ((c_adc_thres - analogRead(CP_pin)) / analog_res_value * 3300.0f) * divider_ratio / mV_A_ratio;
+}
 void optimize_phase_current()
 {
-  if(sense_update)
-  {
-    Ia_LPF.input(Ia - Ia_offset);
-    Ib_LPF.input(Ib - Ib_offset);
-    Ia_f = Ia_LPF.output();
-    Ib_f = Ib_LPF.output();
-    Ic_f = -(Ia_f + Ib_f);
-  }
+  Ib_LPF.input(Ib);
+  Ic_LPF.input(Ic);
+  Ib_f = Ib_LPF.output();
+  Ic_f = Ic_LPF.output();
+  Ia_f = -(Ib_f + Ic_f);
 }
 void optimize_clarke_current()
 {
-  if(sense_update)
-  {
-    Ix_LPF.input(Ix);
-    Iy_LPF.input(Iy);
-    Ix_f = Ix_LPF.output();
-    Iy_f = Iy_LPF.output();
-  }
+  Ix_LPF.input(Ix);
+  Iy_LPF.input(Iy);
+  Ix_f = Ix_LPF.output();
+  Iy_f = Iy_LPF.output();
 }
 void optimize_park_current()
 {
-  if(sense_update)
-  {
-    Id_LPF.input(Id);
-    Iq_LPF.input(Iq);
-    Id_f = Id_LPF.output();
-    Iq_f = Iq_LPF.output();
-  }
+  Id_LPF.input(Id);
+  Iq_LPF.input(Iq);
+  Id_f = Id_LPF.output();
+  Iq_f = Iq_LPF.output();
 }
 void clarke(float Ia_, float Ib_, float Ic_)
 {
@@ -239,7 +315,7 @@ IntervalTimer loop_task;
 const float loop_period = 1000000.0f / loop_freq; // unit -> us
 
 /* debug */
-#define dummy_vector 3.0f // maximum -> power supply voltage   
+#define dummy_vector 8.0f // maximum -> power supply voltage   
 #define test_theta_res 1.0f
 #define rev_per_time 1
 float test_theta = 0; 
@@ -255,7 +331,7 @@ uint8_t pp_count = 0; // pole-pair counter
 #define Ki_q 0.000000f 
 #define Kd_q 0.00f 
 #define setpoint_d 0.0f
-#define setpoint_q 3.5f
+#define setpoint_q 5.5f
 #define error_clearance 1.5
 float error_d, 
       integral_d,
@@ -299,50 +375,89 @@ void inverse_park(float Vd_, float Vq_, float cos_, float sin_, float theta)
 void loop_rountine()
 {
   /* get theta in encoder event */
-  theta_deg = theta;
-  theta_rad = theta_deg * deg_to_rad;
-  cos_theta = cos(theta_rad);
-  sin_theta = sin(theta_rad);
-  
-//  /* get phase current in serialEvent1 */ optimize_phase_current(); 
-//  clarke(Ia_f, Ib_f, Ic_f);               optimize_clarke_current();
-//  park(Ix_f, Iy_f, cos_theta, sin_theta); optimize_park_current();
-  
-  
-  
-  test_theta += test_theta_res; 
-  if(test_theta > 360)
-  {
-    test_theta = test_theta_res;  
-    pp_count++;
-  }
-  if(pp_count > (pp * rev_per_time) - 1)
-  {
-    motor_stop = true; 
-//    Timer3.stop();
-    pp_count = 0;
-    test_theta = 0;
-    loop_task.end();
-  }
+//  theta_deg = theta;  
+//  theta_deg = theta + 90.0f;
+//       if(theta_deg > 360) theta_deg = theta_deg - 360.0f;
+//  else if(theta_deg < 0  ) theta_deg = 360.0f + theta_deg;  
+//  
+//  theta_rad = theta_deg * deg_to_rad;
+//  cos_theta = cos(theta_rad);
+//  sin_theta = sin(theta_rad);
 
-  float theta_rad = test_theta * deg_to_rad;
-  Vx = dummy_vector * cos(theta_rad);  
-  Vy = dummy_vector * sin(theta_rad);
-  inverse_clarke(Vx, Vy);
 
-  
+
+
+//  /* open loop drive */   
+//  test_theta += test_theta_res; 
+//  if(test_theta > 360)
+//  {
+//    test_theta = test_theta - 360.0f;  
+////    test_theta = 360 + test_theta; 
+//    pp_count++;
+//  }
+//  if(pp_count > (pp * rev_per_time) - 1) 
+//  {
+//    motor_stop = true;
+//    pp_count = 0;
+//    loop_task.end();
+//  }
+//  Vx = dummy_vector * cos(test_theta * deg_to_rad);  
+//  Vy = dummy_vector * sin(test_theta * deg_to_rad);
+//  inverse_clarke(Vx, Vy);
+
+
+
+
+//  theta_deg += 90.0f;
+//  theta_rad = theta_deg * deg_to_rad;
+//  cos_theta = cos(theta_rad);
+//  sin_theta = sin(theta_rad);
+
 //  PI_control(Id_f, Iq_f);
 //  inverse_park(Vd, Vq, cos_theta, sin_theta, theta_deg);  
-//  inverse_clarke(Vx, Vy);
-//  
-//  sense_update = false;
-   
 
+  
+  
+  /* position control test! */
+  #define Kp 1.8f
+  float th, p, error;
+  float sp = map(analogRead(4), 0, analog_res_value, 10, 350);
+
+  p = sp - theta_rev;
+  p *= Kp;
+  if(p > 0)
+    th = theta + 90;
+  else
+    th = theta - 90;
+  
+  p = abs(p);
+       if(p > 12) p = 12.0f;
+  else if(p < 0)  p = 0.0f;
+  
+       if(th > 360) th = th - 360.0f;
+  else if(th < 0  ) th = 360.0f + th;  
+  Vx = p * cos(th * deg_to_rad);  
+  Vy = p * sin(th * deg_to_rad);
+ 
+  
+  
+//  /* sinusoidal control */
+//  const float out_vect = 12.0f; 
+//  float th = theta + 90.0f;
+//       if(th > 360) th = th - 360.0f;
+//  else if(th < 0  ) th = 360.0f + th;  
+//  Vx = out_vect * cos(th * deg_to_rad);  
+//  Vy = out_vect * sin(th * deg_to_rad);
+  
+  inverse_clarke(Vx, Vy);
+
+
+//  float It = sqrts(Ix * Ix + Iy * Iy);
 //  float sine_wave = sin(theta * deg_to_rad);
-//  Serial.print(Id_f);Serial.print("\t");
+  
+//  Serial.print(Id);Serial.print("\t");
+//  Serial.println(theta_rev);
 
-//  Serial.print(Id_f);Serial.print("\t");
-//  Serial.println(analogRead(8));
 }
 /////////////////////////////////////////////////////
 
@@ -361,49 +476,50 @@ void setup()
   pinMode(A_CH_pin, INPUT);
   pinMode(B_CH_pin, INPUT);
   pinMode(Z_CH_pin, INPUT);
-  
-  /* svm */
-  Timer1.initialize(pwm_period);
-  Timer1.attachInterrupt(svm_generate);
 
-//  /* encoder */
-//  // interrupt
-//  Timer3.initialize(encoder_period);
-//  Timer3.attachInterrupt(encoder_event);
-//  // alignment
-//  unsigned long prevTime = millis();
-//  while(millis() - prevTime <= 2000)
-//  {
-//    inverse_clarke(6.0f, 0.0f);
-//    theta = 0;
-//  }
-//  
-//  /* current sensor */
-//  // communicate
-//  Serial1.begin(sense_baudrate);
-//  Serial.setTimeout(sense_timeout);
+  /* current sensor */
+  analogReadResolution(analog_res);
+  phase_current_alignment();
+  
+//  Serial.println(analog_threshold); delay(3000);
+
 //  // alignment 
+
 //  delay(sense_wait_start);
 //  Ia_offset = Ia;
 //  Ib_offset = Ib;
   
-  /* system */
+   
+  /* svm */
+  Timer1.initialize(pwm_period);
+  Timer1.attachInterrupt(svm_generate);
+
+  /* encoder */
+  rotor_position_alignment();
+  test_theta = index_theta;
+  // interrupt
+  Timer3.initialize(encoder_period);
+  Timer3.attachInterrupt(encoder_event);
+  
+ /* system */
   // monitor
   Serial.begin(monitor_baudrate);
   // loop
   loop_task.begin(loop_rountine, loop_freq);
-  analogReadResolution(12);
+  
 } 
 
 void loop() 
 {
+  get_phase_current();                optimize_phase_current();
+  clarke(Ia_f, Ib_f, Ic_f);
+  park(Ix, Iy, cos_theta, sin_theta); optimize_park_current();
+  
   if(motor_stop)
   {    
     delay(2000);
     motor_stop = false;
-//    theta = 0;
-//    Timer3.start();
     loop_task.begin(loop_rountine, loop_freq);
   }
-  delay(50);  
+  delay(5);  
 }
